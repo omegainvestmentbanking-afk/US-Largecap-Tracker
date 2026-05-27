@@ -384,90 +384,90 @@ def fetch_edgar(cik):
     }
 
 # ════════════════════════════════════════════════════════════
-#  YAHOO — robust dual-source approach
-#  Primary:  fast_info (lightweight, rarely rate-limited)
-#  Fallback: info (rich data but often blocked on cloud IPs)
+#  FINNHUB — primary source for live market data
+#  Reliable, generous free tier (60 calls/min)
 # ════════════════════════════════════════════════════════════
-def fetch_yahoo(symbol):
+def get_finnhub_key():
+    try:
+        return st.secrets["FINNHUB_API_KEY"]
+    except (KeyError, FileNotFoundError):
+        return None
+
+FINNHUB_KEY = get_finnhub_key()
+
+def fetch_finnhub(symbol):
+    """Returns price, day_chg, market_cap, eps, pe, hi_52, lo_52 from Finnhub."""
     out = {"price": None, "day_chg": None, "market_cap": None,
            "eps": None, "pe": None, "hi_52": None, "lo_52": None, "ebitda": None}
+    if not FINNHUB_KEY:
+        return out
+
+    # Convert BRK-B → BRK.B for Finnhub
+    fh_sym = symbol.replace("-", ".")
+
+    try:
+        # ── 1. Quote endpoint: current price + previous close ──
+        q = requests.get(
+            f"https://finnhub.io/api/v1/quote",
+            params={"symbol": fh_sym, "token": FINNHUB_KEY},
+            timeout=8,
+        ).json()
+        if q.get("c"):  # current price
+            out["price"] = safe(q["c"])
+            prev = q.get("pc")  # previous close
+            if prev and prev != 0:
+                out["day_chg"] = round(((q["c"] - prev) / prev) * 100, 2)
+            if q.get("h"):  # day high — not 52W but useful
+                pass
+    except Exception:
+        pass
+
+    try:
+        # ── 2. Basic financials: P/E, EPS, market cap, 52W ──
+        bf = requests.get(
+            f"https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": fh_sym, "metric": "all", "token": FINNHUB_KEY},
+            timeout=8,
+        ).json()
+        m = bf.get("metric", {}) or {}
+        out["pe"]  = safe(m.get("peTTM") or m.get("peNormalizedAnnual"))
+        out["eps"] = safe(m.get("epsTTM") or m.get("epsBasicExclExtraItemsTTM"))
+        # market cap is in millions USD from Finnhub
+        mc_mn = m.get("marketCapitalization")
+        if mc_mn:
+            out["market_cap"] = round(float(mc_mn) / 1000, 2)  # millions → billions
+        out["hi_52"] = safe(m.get("52WeekHigh"))
+        out["lo_52"] = safe(m.get("52WeekLow"))
+        # EBITDA — annualized from Finnhub
+        ebitda_ann = m.get("ebitdPerShareTTM")
+        # Better: use quarterly endpoint, but for now skip — EBITDA is hard
+    except Exception:
+        pass
+
+    return out
+
+# ════════════════════════════════════════════════════════════
+#  YAHOO — fallback only (for EBITDA which Finnhub doesn't give cleanly)
+# ════════════════════════════════════════════════════════════
+def fetch_yahoo_ebitda(symbol):
     try:
         t = yf.Ticker(symbol)
-
-        # ── PRIMARY: fast_info (price, market cap, 52W — most reliable) ──
-        try:
-            fi = t.fast_info
-            # fast_info is dict-like, access with .get() safely
-            price = None; prev = None
-            try: price = fi.get("last_price") or fi.get("lastPrice")
-            except: pass
-            try: prev = fi.get("previous_close") or fi.get("previousClose")
-            except: pass
-            try: mc = fi.get("market_cap") or fi.get("marketCap")
-            except: mc = None
-            try: hi = fi.get("year_high") or fi.get("yearHigh")
-            except: hi = None
-            try: lo = fi.get("year_low") or fi.get("yearLow")
-            except: lo = None
-
-            if price:
-                out["price"] = safe(price)
-            if price and prev and prev != 0:
-                out["day_chg"] = round(((price - prev) / prev) * 100, 2)
-            if mc:
-                out["market_cap"] = to_billions(mc)
-            if hi:
-                out["hi_52"] = safe(hi)
-            if lo:
-                out["lo_52"] = safe(lo)
-        except Exception:
-            pass
-
-        # ── FALLBACK: history() if fast_info gave us nothing ──
-        if out["price"] is None:
-            try:
-                hist = t.history(period="2d", auto_adjust=False)
-                if hist is not None and len(hist) > 0:
-                    out["price"] = safe(float(hist["Close"].iloc[-1]))
-                    if len(hist) >= 2:
-                        prev = float(hist["Close"].iloc[-2])
-                        if prev != 0:
-                            out["day_chg"] = round(
-                                ((out["price"] - prev) / prev) * 100, 2)
-            except Exception:
-                pass
-
-        # ── EPS / P/E / EBITDA — try info but tolerate failure ──
-        try:
-            info = t.info or {}
-            if out["price"] is None:
-                p = info.get("regularMarketPrice") or info.get("currentPrice")
-                if p: out["price"] = safe(p)
-            if out["market_cap"] is None:
-                out["market_cap"] = to_billions(info.get("marketCap"))
-            if out["hi_52"] is None:
-                out["hi_52"] = safe(info.get("fiftyTwoWeekHigh"))
-            if out["lo_52"] is None:
-                out["lo_52"] = safe(info.get("fiftyTwoWeekLow"))
-            out["eps"] = safe(info.get("trailingEps"))
-            out["pe"]  = safe(info.get("trailingPE"))
-        except Exception:
-            pass
-
-        # ── EBITDA from quarterly financials ──
-        try:
-            qf = t.quarterly_financials
-            if qf is not None and not qf.empty:
-                col = qf[qf.columns[0]]
-                for k in ["EBITDA", "Normalized EBITDA"]:
-                    if k in col.index:
-                        out["ebitda"] = to_millions(col[k]); break
-        except Exception:
-            pass
-
-        return out
+        qf = t.quarterly_financials
+        if qf is not None and not qf.empty:
+            col = qf[qf.columns[0]]
+            for k in ["EBITDA", "Normalized EBITDA"]:
+                if k in col.index:
+                    return to_millions(col[k])
     except Exception:
-        return out
+        pass
+    return None
+
+# Combined Yahoo wrapper for backward compatibility with the rest of the code
+def fetch_yahoo(symbol):
+    out = fetch_finnhub(symbol)
+    if out["ebitda"] is None:
+        out["ebitda"] = fetch_yahoo_ebitda(symbol)
+    return out
 
 # ════════════════════════════════════════════════════════════
 #  PARALLEL FETCH
