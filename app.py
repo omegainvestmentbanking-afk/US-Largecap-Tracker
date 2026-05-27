@@ -99,7 +99,7 @@ if not check_password():
 #  ADMIN-CONFIGURABLE SETTINGS (with defaults)
 # ════════════════════════════════════════════════════════════
 if "refresh_seconds" not in st.session_state:
-    st.session_state.refresh_seconds = 60
+    st.session_state.refresh_seconds = 240   # 4 min default to stay under 60 calls/min Finnhub free tier
 if "new_window_days" not in st.session_state:
     st.session_state.new_window_days = 14
 if "visible_cols" not in st.session_state:
@@ -112,7 +112,8 @@ if "visible_cols" not in st.session_state:
         "Bloomberg Code": True, "10-Q Filing": True,
     }
 
-PARALLEL_WORKERS = 12
+PARALLEL_WORKERS = 1   # Serialize for Finnhub free tier (60 calls/min)
+FINNHUB_DELAY = 2.2    # 2 calls per ticker × 2.2s = ~55 calls/min (safe under 60)
 
 # ════════════════════════════════════════════════════════════
 #  MAIN CSS
@@ -402,8 +403,14 @@ def fetch_finnhub(symbol):
     if not FINNHUB_KEY:
         return out
 
-    # Convert BRK-B → BRK.B for Finnhub
-    fh_sym = symbol.replace("-", ".")
+    # Finnhub ticker mapping
+    # Most US tickers work as-is. Special cases:
+    fh_sym = symbol
+    if symbol == "BRK-B":
+        fh_sym = "BRK.B"
+    elif symbol == "GLTR":
+        # ETF — Finnhub may not have this; return blank
+        return out
 
     try:
         # ── 1. Quote endpoint: current price + previous close ──
@@ -499,16 +506,24 @@ def fetch_one(sym, name, cik, window_days):
         "10-Q Filing": e["filing_url"] or "",
     }
 
-# Cache for 1 second (just to allow same-cycle reuse), refresh handled by interval
+# Serial fetch with delay to respect Finnhub free tier (60 calls/min)
 def _do_full_fetch(window_days):
+    import time as _time
     rows = []
     items = list(COMPANIES.items())
-    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        futures = {executor.submit(fetch_one, sym, name, cik, window_days): sym
-                   for sym, (name, cik) in items}
-        for future in as_completed(futures):
-            try: rows.append(future.result())
-            except Exception: pass
+    progress_text = st.empty()
+
+    for i, (sym, (name, cik)) in enumerate(items, 1):
+        progress_text.caption(f"Fetching {i}/{len(items)} · {sym}")
+        try:
+            rows.append(fetch_one(sym, name, cik, window_days))
+        except Exception:
+            pass
+        # Throttle: ~1 sec between calls keeps us safely under 60/min
+        # Each fetch_one does 2 Finnhub calls (quote + metrics), so delay covers both
+        _time.sleep(FINNHUB_DELAY)
+
+    progress_text.empty()
     df = pd.DataFrame(rows)
     df = df.sort_values(
         by=["_is_new", "_filed", "_raw_ticker"],
@@ -566,8 +581,9 @@ if is_admin:
         st.caption("Only admins see this. Changes apply immediately.")
 
         st.markdown("**Refresh interval (seconds)**")
+        st.caption("⚠️ Finnhub free tier = 60 calls/min. Minimum recommended: 180s.")
         st.session_state.refresh_seconds = st.select_slider(
-            "Refresh interval", options=[30, 60, 120, 300, 600],
+            "Refresh interval", options=[180, 240, 300, 600, 900],
             value=st.session_state.refresh_seconds,
             label_visibility="collapsed",
         )
