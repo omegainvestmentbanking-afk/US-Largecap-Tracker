@@ -706,6 +706,11 @@ def dashboard():
     st.markdown("---")
     st.markdown("### All Companies")
 
+    # Defensive: ensure we have data
+    if df is None or len(df) == 0:
+        st.warning("No data loaded yet. Wait for next refresh cycle.")
+        return
+
     display_df = df.copy()
     if search:
         mask = (display_df["_raw_ticker"].str.contains(search, case=False, na=False) |
@@ -721,7 +726,12 @@ def dashboard():
         c for c, show in st.session_state.visible_cols.items() if show
     ]
     visible = [c for c in visible if c in display_df.columns]
+    if len(visible) == 0:
+        visible = list(display_df.columns)   # safety: show all if nothing selected
     display_df = display_df[visible]
+
+    # Show row count for transparency
+    st.caption(f"Showing {len(display_df)} companies · scroll horizontally for all columns")
 
     def color_chg(val):
         if pd.isna(val): return ""
@@ -738,10 +748,6 @@ def dashboard():
     }
     fmt = {k: v for k, v in fmt.items() if k in display_df.columns}
 
-    styled = display_df.style.format(fmt, na_rep="–")
-    if "Day Chg %" in display_df.columns:
-        styled = styled.map(color_chg, subset=["Day Chg %"])
-
     col_config = {
         "Company": st.column_config.TextColumn(width="medium"),
         "Ticker": st.column_config.TextColumn(width="small",
@@ -757,15 +763,25 @@ def dashboard():
             help="Copy-paste into Bloomberg Terminal"
         )
 
-    st.dataframe(styled, use_container_width=True, hide_index=True, height=620,
-                 column_config=col_config)
+    # Try styled version first; fall back to plain dataframe if it fails
+    try:
+        styled = display_df.style.format(fmt, na_rep="–")
+        if "Day Chg %" in display_df.columns:
+            styled = styled.map(color_chg, subset=["Day Chg %"])
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=620,
+                     column_config=col_config)
+    except Exception as table_err:
+        st.warning(f"Styled view failed ({table_err}); showing plain table.")
+        st.dataframe(display_df, use_container_width=True, hide_index=True, height=620,
+                     column_config=col_config)
 
 dashboard()
 
 st.markdown(
     '<div class="sheet-meta" style="border-top: 1px solid #e0e0e0; border-bottom: none; '
     'margin-top: 1.5rem; padding-top: 0.8rem;">'
-    'Data sources: Yahoo Finance (price, market cap, 52W, P/E, EPS, EBITDA — 15-min delayed) · '
+    'Data sources: Finnhub (price, market cap, 52W, P/E, EPS — real-time) · '
+    'Yahoo Finance (EBITDA) · '
     'SEC EDGAR (Revenue, PAT, Quarter, filing link — authoritative) · '
     'Financials in USD millions · Market cap in USD billions · '
     '🆕 = new 10-Q filed recently, pinned to top · '
