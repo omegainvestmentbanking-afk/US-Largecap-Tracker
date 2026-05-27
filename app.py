@@ -22,7 +22,7 @@ st.set_page_config(
     page_title="US Large-Cap Tracker",
     page_icon="📊",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="collapsed",
 )
 
 # ════════════════════════════════════════════════════════════
@@ -384,40 +384,90 @@ def fetch_edgar(cik):
     }
 
 # ════════════════════════════════════════════════════════════
-#  YAHOO — now also fetches Market Cap
+#  YAHOO — robust dual-source approach
+#  Primary:  fast_info (lightweight, rarely rate-limited)
+#  Fallback: info (rich data but often blocked on cloud IPs)
 # ════════════════════════════════════════════════════════════
 def fetch_yahoo(symbol):
+    out = {"price": None, "day_chg": None, "market_cap": None,
+           "eps": None, "pe": None, "hi_52": None, "lo_52": None, "ebitda": None}
     try:
         t = yf.Ticker(symbol)
-        info = t.info or {}
-        price = info.get("regularMarketPrice") or info.get("currentPrice")
-        prev = info.get("regularMarketPreviousClose") or info.get("previousClose")
-        day_chg = None
-        if price and prev and prev != 0:
-            day_chg = round(((price - prev) / prev) * 100, 2)
 
-        market_cap = to_billions(info.get("marketCap"))
+        # ── PRIMARY: fast_info (price, market cap, 52W — most reliable) ──
+        try:
+            fi = t.fast_info
+            # fast_info is dict-like, access with .get() safely
+            price = None; prev = None
+            try: price = fi.get("last_price") or fi.get("lastPrice")
+            except: pass
+            try: prev = fi.get("previous_close") or fi.get("previousClose")
+            except: pass
+            try: mc = fi.get("market_cap") or fi.get("marketCap")
+            except: mc = None
+            try: hi = fi.get("year_high") or fi.get("yearHigh")
+            except: hi = None
+            try: lo = fi.get("year_low") or fi.get("yearLow")
+            except: lo = None
 
-        ebitda = None
+            if price:
+                out["price"] = safe(price)
+            if price and prev and prev != 0:
+                out["day_chg"] = round(((price - prev) / prev) * 100, 2)
+            if mc:
+                out["market_cap"] = to_billions(mc)
+            if hi:
+                out["hi_52"] = safe(hi)
+            if lo:
+                out["lo_52"] = safe(lo)
+        except Exception:
+            pass
+
+        # ── FALLBACK: history() if fast_info gave us nothing ──
+        if out["price"] is None:
+            try:
+                hist = t.history(period="2d", auto_adjust=False)
+                if hist is not None and len(hist) > 0:
+                    out["price"] = safe(float(hist["Close"].iloc[-1]))
+                    if len(hist) >= 2:
+                        prev = float(hist["Close"].iloc[-2])
+                        if prev != 0:
+                            out["day_chg"] = round(
+                                ((out["price"] - prev) / prev) * 100, 2)
+            except Exception:
+                pass
+
+        # ── EPS / P/E / EBITDA — try info but tolerate failure ──
+        try:
+            info = t.info or {}
+            if out["price"] is None:
+                p = info.get("regularMarketPrice") or info.get("currentPrice")
+                if p: out["price"] = safe(p)
+            if out["market_cap"] is None:
+                out["market_cap"] = to_billions(info.get("marketCap"))
+            if out["hi_52"] is None:
+                out["hi_52"] = safe(info.get("fiftyTwoWeekHigh"))
+            if out["lo_52"] is None:
+                out["lo_52"] = safe(info.get("fiftyTwoWeekLow"))
+            out["eps"] = safe(info.get("trailingEps"))
+            out["pe"]  = safe(info.get("trailingPE"))
+        except Exception:
+            pass
+
+        # ── EBITDA from quarterly financials ──
         try:
             qf = t.quarterly_financials
             if qf is not None and not qf.empty:
                 col = qf[qf.columns[0]]
                 for k in ["EBITDA", "Normalized EBITDA"]:
                     if k in col.index:
-                        ebitda = to_millions(col[k]); break
-        except Exception: pass
+                        out["ebitda"] = to_millions(col[k]); break
+        except Exception:
+            pass
 
-        return {
-            "price": safe(price), "day_chg": day_chg,
-            "market_cap": market_cap,
-            "eps": safe(info.get("trailingEps")), "pe": safe(info.get("trailingPE")),
-            "hi_52": safe(info.get("fiftyTwoWeekHigh")), "lo_52": safe(info.get("fiftyTwoWeekLow")),
-            "ebitda": ebitda,
-        }
+        return out
     except Exception:
-        return {"price": None, "day_chg": None, "market_cap": None, "eps": None, "pe": None,
-                "hi_52": None, "lo_52": None, "ebitda": None}
+        return out
 
 # ════════════════════════════════════════════════════════════
 #  PARALLEL FETCH
