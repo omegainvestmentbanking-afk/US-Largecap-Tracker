@@ -10,9 +10,18 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
+
+# Timezone helpers
+IST = timezone(timedelta(hours=5, minutes=30))
+# US Eastern auto-handles daylight saving via standard library
+try:
+    from zoneinfo import ZoneInfo
+    US_EAST = ZoneInfo("America/New_York")
+except ImportError:
+    US_EAST = timezone(timedelta(hours=-5))  # fallback to EST
 
 st.set_page_config(
     page_title="US Large-Cap Tracker",
@@ -626,16 +635,59 @@ age_secs = (datetime.now() - last_update).total_seconds()
 is_stale = age_secs >= REFRESH_SECONDS
 stale_pill = '<span class="updating">refreshing…</span>' if is_stale else ''
 
+# Format both IST and US Eastern times
+# st.session_state.last_fetch is a naive datetime in server local time
+# We treat it as UTC since Streamlit Cloud servers run in UTC
+last_utc = last_update.replace(tzinfo=timezone.utc) if last_update.tzinfo is None else last_update
+last_ist = last_utc.astimezone(IST)
+last_est = last_utc.astimezone(US_EAST)
+est_label = last_est.strftime("%Z")  # "EST" or "EDT" depending on DST
+
+now_utc = datetime.now(timezone.utc)
+now_ist = now_utc.astimezone(IST)
+now_est = now_utc.astimezone(US_EAST)
+
 st.markdown(
     f'<div class="sheet-meta">'
     f'<span class="live-dot"></span>'
     f'<span class="accent">Live</span> · '
-    f'{datetime.now().strftime("%A, %B %d, %Y")} · '
+    f'{now_ist.strftime("%A, %B %d, %Y")} · '
     f'<span class="accent">{len(COMPANIES)}</span> companies · '
-    f'Last updated <span class="accent">{last_update.strftime("%H:%M:%S")}</span>'
+    f'Last updated <span class="accent">{last_ist.strftime("%H:%M")} IST</span> '
+    f'/ <span class="accent">{last_est.strftime("%H:%M")} {est_label}</span>'
     f'{stale_pill} · '
     f'Refresh every {REFRESH_SECONDS//60} min · '
     f'Source: Yahoo Finance + SEC EDGAR'
+    f'</div>',
+    unsafe_allow_html=True
+)
+
+# ── US market status indicator ─────────────────────────────
+def us_market_status(now_est_dt):
+    """Returns (label, color) tuple. US markets: Mon-Fri 9:30 AM - 4:00 PM ET."""
+    wd = now_est_dt.weekday()  # 0=Mon, 6=Sun
+    if wd >= 5:
+        return ("Closed · Weekend", "#5f6368")
+    mins = now_est_dt.hour * 60 + now_est_dt.minute
+    if mins < 4 * 60:                      # before 4 AM ET
+        return ("Closed · Overnight", "#5f6368")
+    elif mins < 9 * 60 + 30:               # 4 AM - 9:30 AM ET
+        return ("Pre-market", "#f9ab00")
+    elif mins < 16 * 60:                   # 9:30 AM - 4:00 PM ET
+        return ("Open · Regular hours", "#137333")
+    elif mins < 20 * 60:                   # 4 PM - 8 PM ET
+        return ("After-hours", "#f9ab00")
+    else:
+        return ("Closed", "#5f6368")
+
+mkt_label, mkt_color = us_market_status(now_est)
+st.markdown(
+    f'<div style="margin-top:-0.8rem;margin-bottom:1rem;font-size:0.78rem;color:#5f6368;font-family:Roboto,sans-serif;">'
+    f'<span style="display:inline-block;width:8px;height:8px;border-radius:50%;'
+    f'background:{mkt_color};margin-right:6px;vertical-align:middle;"></span>'
+    f'US Market: <strong style="color:{mkt_color}">{mkt_label}</strong> · '
+    f'Now in NY: {now_est.strftime("%I:%M %p")} {est_label} · '
+    f'Now in India: {now_ist.strftime("%I:%M %p")} IST'
     f'</div>',
     unsafe_allow_html=True
 )
