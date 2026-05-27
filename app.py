@@ -1,6 +1,9 @@
 # ============================================================
-#  US LARGE-CAP LIVE TRACKER — Password Protected
-#  Clean Google Sheets-style dashboard with 30-day session cookie
+#  US LARGE-CAP LIVE TRACKER — Full Featured
+#  - Password gate + 30-day session
+#  - Market Cap + Bloomberg Code columns
+#  - Admin Mode (unlocked via second password)
+#  - Persistent display (no white screen during refresh)
 #
 #  Live data:  Yahoo Finance
 #  Filed data: SEC EDGAR
@@ -14,12 +17,7 @@ import pandas as pd
 import requests
 from datetime import datetime, date, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
-import secrets
 
-# ════════════════════════════════════════════════════════════
-#  PAGE CONFIG
-# ════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="US Large-Cap Tracker",
     page_icon="📊",
@@ -28,27 +26,23 @@ st.set_page_config(
 )
 
 # ════════════════════════════════════════════════════════════
-#  AUTHENTICATION
-#  Password is stored in Streamlit's secrets (set in dashboard UI)
-#  Falls back to a default for local testing
+#  AUTHENTICATION (user + admin)
 # ════════════════════════════════════════════════════════════
-DEFAULT_PASSWORD = "change-me-in-secrets"   # only used for local testing
+DEFAULT_PASSWORD = "change-me"
+DEFAULT_ADMIN_PASSWORD = "admin-change-me"
 
 def get_password():
-    """Read password from st.secrets; fall back to default locally."""
-    try:
-        return st.secrets["APP_PASSWORD"]
-    except (KeyError, FileNotFoundError):
-        return DEFAULT_PASSWORD
+    try: return st.secrets["APP_PASSWORD"]
+    except (KeyError, FileNotFoundError): return DEFAULT_PASSWORD
+
+def get_admin_password():
+    try: return st.secrets["ADMIN_PASSWORD"]
+    except (KeyError, FileNotFoundError): return DEFAULT_ADMIN_PASSWORD
 
 def check_password():
-    """Returns True if user already authenticated, otherwise shows login form."""
-    # Already authenticated this session? — let them through
     if st.session_state.get("authenticated"):
         return True
 
-    # ── Login screen ──
-    # Use minimal styling for the gate
     st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap');
@@ -60,16 +54,9 @@ def check_password():
         text-align: center; box-shadow: 0 1px 3px rgba(0,0,0,0.06);
     }
     .login-icon { font-size: 2.5rem; margin-bottom: 0.8rem; }
-    .login-title {
-        font-size: 1.4rem; font-weight: 500; color: #202124;
-        margin-bottom: 0.3rem; letter-spacing: -0.01em;
-    }
-    .login-sub {
-        font-size: 0.85rem; color: #5f6368; margin-bottom: 1.5rem;
-    }
-    .stTextInput > div > div > input {
-        font-size: 0.95rem !important; padding: 0.6rem 0.8rem !important;
-    }
+    .login-title { font-size: 1.4rem; font-weight: 500; color: #202124; margin-bottom: 0.3rem; }
+    .login-sub { font-size: 0.85rem; color: #5f6368; margin-bottom: 1.5rem; }
+    .stTextInput > div > div > input { font-size: 0.95rem !important; padding: 0.6rem 0.8rem !important; }
     .stButton > button {
         width: 100%; background: #1a73e8; color: #ffffff;
         border: 1px solid #1a73e8; padding: 0.55rem; font-weight: 500;
@@ -79,7 +66,6 @@ def check_password():
     </style>
     """, unsafe_allow_html=True)
 
-    # Centered card
     _, mid, _ = st.columns([1, 2, 1])
     with mid:
         st.markdown(
@@ -98,187 +84,157 @@ def check_password():
             if pw == get_password():
                 st.session_state.authenticated = True
                 st.rerun()
+            elif pw == get_admin_password():
+                st.session_state.authenticated = True
+                st.session_state.is_admin = True
+                st.rerun()
             else:
                 st.error("Incorrect password.")
-
     return False
 
-# Gate the entire app behind login
 if not check_password():
     st.stop()
 
 # ════════════════════════════════════════════════════════════
-#  MAIN APP — only runs if authenticated
+#  ADMIN-CONFIGURABLE SETTINGS (with defaults)
 # ════════════════════════════════════════════════════════════
+if "refresh_seconds" not in st.session_state:
+    st.session_state.refresh_seconds = 60
+if "new_window_days" not in st.session_state:
+    st.session_state.new_window_days = 14
+if "visible_cols" not in st.session_state:
+    st.session_state.visible_cols = {
+        "Price ($)": True, "Day Chg %": True, "Market Cap ($B)": True,
+        "EPS TTM ($)": True, "P/E TTM": True,
+        "52W High ($)": True, "52W Low ($)": True,
+        "Quarter": True, "Period End": False, "Filed Date": False,
+        "Revenue ($M)": True, "PAT ($M)": True, "EBITDA ($M)": True,
+        "Bloomberg Code": True, "10-Q Filing": True,
+    }
 
-# ── Google Sheets-style CSS ──
+PARALLEL_WORKERS = 12
+
+# ════════════════════════════════════════════════════════════
+#  MAIN CSS
+# ════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&family=Roboto+Mono:wght@400;500&display=swap');
 
-.stApp {
-    background: #ffffff;
-    color: #202124;
-    font-family: 'Roboto', Arial, sans-serif;
-}
-
-.main .block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 2rem;
-    max-width: 1600px;
-}
-
+.stApp { background: #ffffff; color: #202124; font-family: 'Roboto', Arial, sans-serif; }
+.main .block-container { padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1700px; }
 #MainMenu, footer, header {visibility: hidden;}
 
 h1 {
-    font-family: 'Roboto', sans-serif !important;
-    font-weight: 500 !important;
-    font-size: 1.6rem !important;
-    color: #202124 !important;
-    margin-bottom: 0.2rem !important;
-    letter-spacing: -0.01em !important;
+    font-family: 'Roboto', sans-serif !important; font-weight: 500 !important;
+    font-size: 1.6rem !important; color: #202124 !important;
+    margin-bottom: 0.2rem !important; letter-spacing: -0.01em !important;
 }
 
 .sheet-meta {
-    font-family: 'Roboto', sans-serif;
-    font-size: 0.82rem;
-    color: #5f6368;
-    padding-bottom: 0.8rem;
-    border-bottom: 1px solid #e0e0e0;
-    margin-bottom: 1rem;
+    font-family: 'Roboto', sans-serif; font-size: 0.82rem;
+    color: #5f6368; padding-bottom: 0.8rem;
+    border-bottom: 1px solid #e0e0e0; margin-bottom: 1rem;
 }
 .sheet-meta .accent { color: #1a73e8; font-weight: 500; }
+.sheet-meta .admin-badge {
+    background: #fef7e0; color: #b06000; border: 1px solid #f9ab00;
+    padding: 1px 8px; border-radius: 10px; font-size: 0.72rem;
+    font-weight: 500; margin-left: 6px;
+}
 .sheet-meta .live-dot {
     display: inline-block; width: 7px; height: 7px; border-radius: 50%;
     background: #34a853; margin-right: 5px;
     animation: pulse 1.6s ease-in-out infinite;
 }
-@keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-}
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 h2, h3 {
     font-family: 'Roboto', sans-serif !important;
-    color: #202124 !important;
-    font-weight: 500 !important;
+    color: #202124 !important; font-weight: 500 !important;
 }
 h3 {
-    font-size: 0.95rem !important;
-    color: #5f6368 !important;
-    text-transform: none !important;
-    letter-spacing: 0 !important;
+    font-size: 0.95rem !important; color: #5f6368 !important;
+    text-transform: none !important; letter-spacing: 0 !important;
     margin-top: 0.8rem !important;
 }
 
 [data-testid="stMetric"] {
-    background: #f8f9fa;
-    border: 1px solid #e0e0e0;
-    border-radius: 6px;
-    padding: 0.7rem 0.9rem;
+    background: #f8f9fa; border: 1px solid #e0e0e0;
+    border-radius: 6px; padding: 0.7rem 0.9rem;
 }
 [data-testid="stMetricLabel"] {
-    font-size: 0.75rem !important;
-    color: #5f6368 !important;
-    font-weight: 400 !important;
+    font-size: 0.75rem !important; color: #5f6368 !important; font-weight: 400 !important;
 }
 [data-testid="stMetricValue"] {
-    font-family: 'Roboto', sans-serif !important;
-    font-weight: 500 !important;
-    color: #202124 !important;
-    font-size: 1.4rem !important;
+    font-family: 'Roboto', sans-serif !important; font-weight: 500 !important;
+    color: #202124 !important; font-size: 1.4rem !important;
 }
 
 hr { border-color: #e0e0e0 !important; margin: 1rem 0 !important; }
 
-[data-testid="stDataFrame"] {
-    border: 1px solid #e0e0e0;
-    border-radius: 4px;
-}
+[data-testid="stDataFrame"] { border: 1px solid #e0e0e0; border-radius: 4px; }
 
 .stButton > button {
-    background: #ffffff;
-    color: #1a73e8;
-    border: 1px solid #dadce0;
-    font-family: 'Roboto', sans-serif;
-    font-size: 0.85rem;
-    font-weight: 500;
-    border-radius: 4px;
-    padding: 0.4rem 1rem;
-    text-transform: none;
+    background: #ffffff; color: #1a73e8; border: 1px solid #dadce0;
+    font-family: 'Roboto', sans-serif; font-size: 0.85rem;
+    font-weight: 500; border-radius: 4px; padding: 0.4rem 1rem; text-transform: none;
 }
-.stButton > button:hover {
-    background: #f8f9fa;
-    border-color: #1a73e8;
-}
+.stButton > button:hover { background: #f8f9fa; border-color: #1a73e8; }
 
 .stDownloadButton > button {
-    background: #1a73e8;
-    color: #ffffff;
-    border: 1px solid #1a73e8;
-    font-family: 'Roboto', sans-serif;
-    font-size: 0.85rem;
-    font-weight: 500;
-    border-radius: 4px;
-    padding: 0.4rem 1rem;
-    text-transform: none;
+    background: #1a73e8; color: #ffffff; border: 1px solid #1a73e8;
+    font-family: 'Roboto', sans-serif; font-size: 0.85rem;
+    font-weight: 500; border-radius: 4px; padding: 0.4rem 1rem; text-transform: none;
 }
 .stDownloadButton > button:hover { background: #1557b0; }
 
 .stTextInput > div > div > input {
-    background: #ffffff;
-    border: 1px solid #dadce0;
-    color: #202124;
-    font-family: 'Roboto', sans-serif;
-    border-radius: 4px;
-    font-size: 0.9rem;
+    background: #ffffff; border: 1px solid #dadce0;
+    color: #202124; font-family: 'Roboto', sans-serif;
+    border-radius: 4px; font-size: 0.9rem;
 }
 .stTextInput > div > div > input:focus {
-    border-color: #1a73e8;
-    box-shadow: 0 0 0 1px #1a73e8;
+    border-color: #1a73e8; box-shadow: 0 0 0 1px #1a73e8;
 }
 
 .stCaption, [data-testid="stCaptionContainer"] {
-    color: #5f6368 !important;
-    font-family: 'Roboto', sans-serif !important;
-    font-size: 0.78rem !important;
+    color: #5f6368 !important; font-family: 'Roboto', sans-serif !important; font-size: 0.78rem !important;
 }
 
 .stProgress > div > div > div > div { background: #1a73e8; }
 
 .new-banner {
-    background: #fef7e0;
-    border: 1px solid #f9ab00;
-    border-left: 4px solid #f9ab00;
-    border-radius: 4px;
-    padding: 10px 14px;
-    margin: 14px 0;
-    font-family: 'Roboto', sans-serif;
-    font-size: 0.85rem;
-    color: #3c4043;
+    background: #fef7e0; border: 1px solid #f9ab00;
+    border-left: 4px solid #f9ab00; border-radius: 4px;
+    padding: 10px 14px; margin: 14px 0;
+    font-family: 'Roboto', sans-serif; font-size: 0.85rem; color: #3c4043;
 }
-.new-banner .head {
-    color: #b06000;
-    font-weight: 500;
-    display: block;
-    margin-bottom: 4px;
-}
+.new-banner .head { color: #b06000; font-weight: 500; display: block; margin-bottom: 4px; }
 .new-banner .ticker-chip {
+    display: inline-block; background: #ffffff;
+    border: 1px solid #f9ab00; color: #b06000;
+    padding: 2px 8px; margin: 2px 3px 2px 0;
+    border-radius: 12px; font-weight: 500; font-size: 0.78rem;
+}
+
+/* Subtle "updating" indicator in corner instead of white screen */
+.updating-pill {
     display: inline-block;
-    background: #ffffff;
-    border: 1px solid #f9ab00;
-    color: #b06000;
-    padding: 2px 8px;
-    margin: 2px 3px 2px 0;
+    background: rgba(26, 115, 232, 0.1);
+    color: #1a73e8;
+    padding: 2px 10px;
     border-radius: 12px;
+    font-size: 0.72rem;
     font-weight: 500;
-    font-size: 0.78rem;
+    margin-left: 8px;
+    animation: pulse 1.6s ease-in-out infinite;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════════
-#  COMPANIES (106 unique tickers)
+#  COMPANIES
 # ════════════════════════════════════════════════════════════
 COMPANIES = {
     "MMM": ("3M Company", 66740), "ABT": ("Abbott Laboratories", 1800),
@@ -336,10 +292,6 @@ COMPANIES = {
     "DIS": ("Walt Disney Company", 1744489), "WFC": ("Wells Fargo", 72971),
 }
 
-REFRESH_SECONDS = 60
-PARALLEL_WORKERS = 12
-NEW_FILING_WINDOW_DAYS = 14
-
 # ════════════════════════════════════════════════════════════
 #  HELPERS
 # ════════════════════════════════════════════════════════════
@@ -354,6 +306,18 @@ def to_millions(value):
         if value is None or pd.isna(value): return None
         return round(float(value) / 1_000_000, 1)
     except (TypeError, ValueError): return None
+
+def to_billions(value):
+    try:
+        if value is None or pd.isna(value): return None
+        return round(float(value) / 1_000_000_000, 2)
+    except (TypeError, ValueError): return None
+
+def bloomberg_code(ticker):
+    """Convert Yahoo ticker → Bloomberg Terminal format."""
+    # BRK-B → BRK/B  (Bloomberg uses /)
+    bb_ticker = ticker.replace("-", "/")
+    return f"{bb_ticker} US Equity"
 
 # ════════════════════════════════════════════════════════════
 #  EDGAR
@@ -379,8 +343,7 @@ def fetch_edgar(cik):
         r = requests.get(url, headers=EDGAR_HEADERS, timeout=15)
         if r.status_code != 200: return empty
         facts = r.json()
-    except Exception:
-        return empty
+    except Exception: return empty
 
     def latest(concepts):
         best = None
@@ -402,8 +365,7 @@ def fetch_edgar(cik):
                 except Exception: continue
         return best
 
-    rev = latest(REV_CONCEPTS)
-    ni = latest(NI_CONCEPTS)
+    rev = latest(REV_CONCEPTS); ni = latest(NI_CONCEPTS)
     primary = ni or rev
     if primary is None: return empty
 
@@ -417,14 +379,12 @@ def fetch_edgar(cik):
     return {
         "rev": to_millions(rev["val"]) if rev else None,
         "pat": to_millions(ni["val"]) if ni else None,
-        "qtr_label": qtr_label,
-        "filing_url": filing_url,
-        "period_end": primary.get("end"),
-        "filed": primary.get("filed"),
+        "qtr_label": qtr_label, "filing_url": filing_url,
+        "period_end": primary.get("end"), "filed": primary.get("filed"),
     }
 
 # ════════════════════════════════════════════════════════════
-#  YAHOO
+#  YAHOO — now also fetches Market Cap
 # ════════════════════════════════════════════════════════════
 def fetch_yahoo(symbol):
     try:
@@ -435,6 +395,8 @@ def fetch_yahoo(symbol):
         day_chg = None
         if price and prev and prev != 0:
             day_chg = round(((price - prev) / prev) * 100, 2)
+
+        market_cap = to_billions(info.get("marketCap"))
 
         ebitda = None
         try:
@@ -448,93 +410,159 @@ def fetch_yahoo(symbol):
 
         return {
             "price": safe(price), "day_chg": day_chg,
+            "market_cap": market_cap,
             "eps": safe(info.get("trailingEps")), "pe": safe(info.get("trailingPE")),
             "hi_52": safe(info.get("fiftyTwoWeekHigh")), "lo_52": safe(info.get("fiftyTwoWeekLow")),
             "ebitda": ebitda,
         }
     except Exception:
-        return {"price": None, "day_chg": None, "eps": None, "pe": None,
+        return {"price": None, "day_chg": None, "market_cap": None, "eps": None, "pe": None,
                 "hi_52": None, "lo_52": None, "ebitda": None}
 
 # ════════════════════════════════════════════════════════════
 #  PARALLEL FETCH
 # ════════════════════════════════════════════════════════════
-def is_new(filed_date_str):
+def is_new(filed_date_str, window_days):
     if not filed_date_str: return False
     try:
         filed = date.fromisoformat(filed_date_str)
-        return (date.today() - filed).days <= NEW_FILING_WINDOW_DAYS
+        return (date.today() - filed).days <= window_days
     except Exception: return False
 
-def fetch_one(sym, name, cik):
-    y = fetch_yahoo(sym)
-    e = fetch_edgar(cik)
-    new_flag = is_new(e["filed"])
+def fetch_one(sym, name, cik, window_days):
+    y = fetch_yahoo(sym); e = fetch_edgar(cik)
+    new_flag = is_new(e["filed"], window_days)
     display_ticker = f"🆕 {sym}" if new_flag else sym
     return {
-        "Company": name,
-        "Ticker": display_ticker,
-        "_raw_ticker": sym,
-        "_is_new": new_flag,
-        "_filed": e["filed"] or "",
-        "Price ($)": y["price"],
-        "Day Chg %": y["day_chg"],
-        "EPS TTM ($)": y["eps"],
-        "P/E TTM": y["pe"],
-        "52W High ($)": y["hi_52"],
-        "52W Low ($)": y["lo_52"],
+        "Company": name, "Ticker": display_ticker,
+        "_raw_ticker": sym, "_is_new": new_flag, "_filed": e["filed"] or "",
+        "Price ($)": y["price"], "Day Chg %": y["day_chg"],
+        "Market Cap ($B)": y["market_cap"],
+        "EPS TTM ($)": y["eps"], "P/E TTM": y["pe"],
+        "52W High ($)": y["hi_52"], "52W Low ($)": y["lo_52"],
         "Quarter": e["qtr_label"] or "—",
         "Period End": e["period_end"] or "—",
         "Filed Date": e["filed"] or "—",
-        "Revenue ($M)": e["rev"],
-        "PAT ($M)": e["pat"],
+        "Revenue ($M)": e["rev"], "PAT ($M)": e["pat"],
         "EBITDA ($M)": y["ebitda"],
+        "Bloomberg Code": bloomberg_code(sym),
         "10-Q Filing": e["filing_url"] or "",
     }
 
-@st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def fetch_all_data():
+# Cache for 1 second (just to allow same-cycle reuse), refresh handled by interval
+def _do_full_fetch(window_days):
     rows = []
     items = list(COMPANIES.items())
-    progress = st.progress(0.0, text=f"Loading {len(items)} companies...")
-
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
-        futures = {executor.submit(fetch_one, sym, name, cik): sym
+        futures = {executor.submit(fetch_one, sym, name, cik, window_days): sym
                    for sym, (name, cik) in items}
-        done = 0
         for future in as_completed(futures):
             try: rows.append(future.result())
             except Exception: pass
-            done += 1
-            progress.progress(done / len(items),
-                              text=f"Loading... {done}/{len(items)}")
-
-    progress.empty()
     df = pd.DataFrame(rows)
     df = df.sort_values(
         by=["_is_new", "_filed", "_raw_ticker"],
         ascending=[False, False, True],
     ).reset_index(drop=True)
-    return df, datetime.now()
+    return df
 
 # ════════════════════════════════════════════════════════════
-#  UI
+#  PERSISTENT DATA — keep showing old data while new loads
 # ════════════════════════════════════════════════════════════
-# Title + small "Sign out" link in top right
+def get_data(window_days, force=False):
+    """Returns (df, last_update, is_fresh). Persists data between fragment runs."""
+    now = datetime.now()
+    last_fetch = st.session_state.get("last_fetch_time")
+    refresh_secs = st.session_state.refresh_seconds
+
+    needs_refresh = (
+        force
+        or last_fetch is None
+        or (now - last_fetch).total_seconds() >= refresh_secs
+        or st.session_state.get("cached_df") is None
+    )
+
+    if needs_refresh:
+        # Show "updating..." pill, but keep old data visible during fetch
+        with st.spinner(""):   # no spinner UI — we use our own pill instead
+            df = _do_full_fetch(window_days)
+        st.session_state.cached_df = df
+        st.session_state.last_fetch_time = now
+        return df, now, True
+
+    return st.session_state.cached_df, last_fetch, False
+
+# ════════════════════════════════════════════════════════════
+#  UI — Header with admin badge if logged in as admin
+# ════════════════════════════════════════════════════════════
+is_admin = st.session_state.get("is_admin", False)
+
 title_col, signout_col = st.columns([10, 1])
 with title_col:
-    st.title("US Large-Cap Tracker")
+    badge = ' <span class="sheet-meta admin-badge">ADMIN</span>' if is_admin else ""
+    st.markdown(f'<h1>US Large-Cap Tracker{badge}</h1>', unsafe_allow_html=True)
 with signout_col:
     if st.button("Sign out", key="signout"):
         st.session_state.authenticated = False
+        st.session_state.is_admin = False
         st.rerun()
 
-@st.fragment(run_every=REFRESH_SECONDS)
+# ════════════════════════════════════════════════════════════
+#  ADMIN SIDEBAR (only visible to admins)
+# ════════════════════════════════════════════════════════════
+if is_admin:
+    with st.sidebar:
+        st.markdown("### ⚙️ Admin Panel")
+        st.caption("Only admins see this. Changes apply immediately.")
+
+        st.markdown("**Refresh interval (seconds)**")
+        st.session_state.refresh_seconds = st.select_slider(
+            "Refresh interval", options=[30, 60, 120, 300, 600],
+            value=st.session_state.refresh_seconds,
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**🆕 NEW badge window (days)**")
+        st.session_state.new_window_days = st.select_slider(
+            "NEW window", options=[7, 14, 21, 30, 45],
+            value=st.session_state.new_window_days,
+            label_visibility="collapsed",
+        )
+
+        st.markdown("**Visible columns**")
+        for col in list(st.session_state.visible_cols.keys()):
+            st.session_state.visible_cols[col] = st.checkbox(
+                col, value=st.session_state.visible_cols[col], key=f"col_{col}"
+            )
+
+        st.markdown("---")
+        if st.button("🗑️ Clear cache & re-fetch all", use_container_width=True):
+            st.cache_data.clear()
+            st.session_state.cached_df = None
+            st.session_state.last_fetch_time = None
+            st.rerun()
+
+        st.markdown("---")
+        st.markdown("**System Status**")
+        last = st.session_state.get("last_fetch_time")
+        st.caption(f"Total companies: **{len(COMPANIES)}**")
+        st.caption(f"Last fetch: **{last.strftime('%H:%M:%S') if last else '—'}**")
+        st.caption(f"Refresh: **{st.session_state.refresh_seconds}s**")
+        st.caption(f"NEW window: **{st.session_state.new_window_days}d**")
+
+# ════════════════════════════════════════════════════════════
+#  DASHBOARD (auto-refresh via fragment)
+# ════════════════════════════════════════════════════════════
+@st.fragment(run_every=st.session_state.refresh_seconds)
 def dashboard():
-    df, last_update = fetch_all_data()
+    window_days = st.session_state.new_window_days
+    df, last_update, is_fresh = get_data(window_days)
+
     valid = df[df["Day Chg %"].notna()]
     new_filings = df[df["_is_new"] == True].copy()
     new_count = len(new_filings)
+
+    fresh_indicator = '' if is_fresh else '<span class="updating-pill">● cached</span>'
 
     st.markdown(
         f'<div class="sheet-meta">'
@@ -542,8 +570,9 @@ def dashboard():
         f'<span class="accent">Live</span> · '
         f'{datetime.now().strftime("%A, %B %d, %Y")} · '
         f'<span class="accent">{len(COMPANIES)}</span> companies · '
-        f'Last updated <span class="accent">{last_update.strftime("%H:%M:%S")}</span> · '
-        f'Auto-refresh every {REFRESH_SECONDS}s · '
+        f'Last updated <span class="accent">{last_update.strftime("%H:%M:%S")}</span>'
+        f'{fresh_indicator} · '
+        f'Refresh every {st.session_state.refresh_seconds}s · '
         f'Source: Yahoo Finance + SEC EDGAR'
         f'</div>',
         unsafe_allow_html=True
@@ -558,7 +587,7 @@ def dashboard():
             f'<div class="new-banner">'
             f'<span class="head">🆕 Just reported · {new_count} '
             f'{"company" if new_count == 1 else "companies"} '
-            f'filed in last {NEW_FILING_WINDOW_DAYS} days — pinned to top</span>'
+            f'filed in last {window_days} days — pinned to top</span>'
             f'{chips_html}'
             f'</div>',
             unsafe_allow_html=True
@@ -582,7 +611,7 @@ def dashboard():
                                key="search", label_visibility="collapsed")
     with a2:
         if st.button("Refresh", use_container_width=True, key="refresh_btn"):
-            st.cache_data.clear()
+            get_data(window_days, force=True)
             st.rerun()
     with a3:
         export_df = df.drop(columns=["_raw_ticker", "_is_new", "_filed"], errors="ignore")
@@ -618,7 +647,15 @@ def dashboard():
         display_df = display_df[mask]
         st.caption(f"{len(display_df)} of {len(df)} match")
 
+    # Drop internal columns
     display_df = display_df.drop(columns=["_raw_ticker", "_is_new", "_filed"], errors="ignore")
+
+    # Apply column visibility (Company + Ticker always shown)
+    visible = ["Company", "Ticker"] + [
+        c for c, show in st.session_state.visible_cols.items() if show
+    ]
+    visible = [c for c in visible if c in display_df.columns]
+    display_df = display_df[visible]
 
     def color_chg(val):
         if pd.isna(val): return ""
@@ -626,38 +663,47 @@ def dashboard():
         if val < 0: return "color: #c5221f; font-weight: 500"
         return ""
 
-    styled = (display_df.style
-              .map(color_chg, subset=["Day Chg %"])
-              .format({
-                  "Price ($)": "{:,.2f}", "Day Chg %": "{:+.2f}%",
-                  "EPS TTM ($)": "{:.2f}", "P/E TTM": "{:.1f}",
-                  "52W High ($)": "{:,.2f}", "52W Low ($)": "{:,.2f}",
-                  "Revenue ($M)": "{:,.0f}",
-                  "PAT ($M)": "{:,.0f}",
-                  "EBITDA ($M)": "{:,.0f}",
-              }, na_rep="–"))
+    fmt = {
+        "Price ($)": "{:,.2f}", "Day Chg %": "{:+.2f}%",
+        "Market Cap ($B)": "{:,.2f}",
+        "EPS TTM ($)": "{:.2f}", "P/E TTM": "{:.1f}",
+        "52W High ($)": "{:,.2f}", "52W Low ($)": "{:,.2f}",
+        "Revenue ($M)": "{:,.0f}", "PAT ($M)": "{:,.0f}", "EBITDA ($M)": "{:,.0f}",
+    }
+    fmt = {k: v for k, v in fmt.items() if k in display_df.columns}
 
-    st.dataframe(
-        styled, use_container_width=True, hide_index=True, height=620,
-        column_config={
-            "10-Q Filing": st.column_config.LinkColumn(
-                "10-Q Filing", display_text="View on EDGAR"
-            ),
-            "Company": st.column_config.TextColumn(width="medium"),
-            "Ticker": st.column_config.TextColumn(width="small",
-                                                   help="🆕 = filed within last 14 days"),
-        },
-    )
+    styled = display_df.style.format(fmt, na_rep="–")
+    if "Day Chg %" in display_df.columns:
+        styled = styled.map(color_chg, subset=["Day Chg %"])
+
+    col_config = {
+        "Company": st.column_config.TextColumn(width="medium"),
+        "Ticker": st.column_config.TextColumn(width="small",
+                                               help="🆕 = filed within last 14 days"),
+    }
+    if "10-Q Filing" in display_df.columns:
+        col_config["10-Q Filing"] = st.column_config.LinkColumn(
+            "10-Q Filing", display_text="View on EDGAR"
+        )
+    if "Bloomberg Code" in display_df.columns:
+        col_config["Bloomberg Code"] = st.column_config.TextColumn(
+            "Bloomberg Code", width="small",
+            help="Copy-paste into Bloomberg Terminal"
+        )
+
+    st.dataframe(styled, use_container_width=True, hide_index=True, height=620,
+                 column_config=col_config)
 
 dashboard()
 
 st.markdown(
     '<div class="sheet-meta" style="border-top: 1px solid #e0e0e0; border-bottom: none; '
     'margin-top: 1.5rem; padding-top: 0.8rem;">'
-    'Data sources: Yahoo Finance (price, 52W, P/E, EPS, EBITDA — 15-min delayed) · '
+    'Data sources: Yahoo Finance (price, market cap, 52W, P/E, EPS, EBITDA — 15-min delayed) · '
     'SEC EDGAR (Revenue, PAT, Quarter, filing link — authoritative) · '
-    'Financials in USD millions · '
-    '🆕 = new 10-Q filed within last 14 days, pinned to top'
+    'Financials in USD millions · Market cap in USD billions · '
+    '🆕 = new 10-Q filed recently, pinned to top · '
+    'Bloomberg codes constructed as TICKER US Equity (BRK/B for Berkshire Class B)'
     '</div>',
     unsafe_allow_html=True
 )
