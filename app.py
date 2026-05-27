@@ -355,6 +355,40 @@ def fetch_edgar(cik):
     }
 
 # ════════════════════════════════════════════════════════════
+#  FINNHUB FALLBACK — only used when Yahoo returns blanks
+# ════════════════════════════════════════════════════════════
+def get_finnhub_key():
+    try: return st.secrets["FINNHUB_API_KEY"]
+    except (KeyError, FileNotFoundError): return None
+
+FINNHUB_KEY = get_finnhub_key()
+
+def fetch_finnhub_metrics(symbol):
+    """Fetch P/E, EPS, Market Cap, 52W from Finnhub. Returns dict with what worked."""
+    out = {"pe": None, "eps": None, "market_cap": None, "hi_52": None, "lo_52": None}
+    if not FINNHUB_KEY:
+        return out
+    fh_sym = symbol
+    if symbol == "BRK-B": fh_sym = "BRK.B"
+    elif symbol == "GLTR": return out
+    try:
+        bf = requests.get(
+            "https://finnhub.io/api/v1/stock/metric",
+            params={"symbol": fh_sym, "metric": "all", "token": FINNHUB_KEY},
+            timeout=8,
+        ).json()
+        m = bf.get("metric", {}) or {}
+        out["pe"]  = safe(m.get("peTTM") or m.get("peNormalizedAnnual"))
+        out["eps"] = safe(m.get("epsTTM") or m.get("epsBasicExclExtraItemsTTM"))
+        mc_mn = m.get("marketCapitalization")
+        if mc_mn: out["market_cap"] = round(float(mc_mn) / 1000, 2)  # mn → bn
+        out["hi_52"] = safe(m.get("52WeekHigh"))
+        out["lo_52"] = safe(m.get("52WeekLow"))
+    except Exception:
+        pass
+    return out
+
+# ════════════════════════════════════════════════════════════
 #  YAHOO (with fallbacks)
 # ════════════════════════════════════════════════════════════
 def fetch_yahoo(symbol):
@@ -431,6 +465,20 @@ def is_new(filed_date_str):
 
 def fetch_one(sym, name, cik):
     y = fetch_yahoo(sym); e = fetch_edgar(cik)
+
+    # ── If Yahoo left key fields blank, try Finnhub to fill them ──
+    needs_fallback = (y["pe"] is None or y["eps"] is None
+                      or y["market_cap"] is None
+                      or y["hi_52"] is None or y["lo_52"] is None)
+    if needs_fallback and FINNHUB_KEY:
+        fh = fetch_finnhub_metrics(sym)
+        if y["pe"] is None and fh["pe"] is not None: y["pe"] = fh["pe"]
+        if y["eps"] is None and fh["eps"] is not None: y["eps"] = fh["eps"]
+        if y["market_cap"] is None and fh["market_cap"] is not None:
+            y["market_cap"] = fh["market_cap"]
+        if y["hi_52"] is None and fh["hi_52"] is not None: y["hi_52"] = fh["hi_52"]
+        if y["lo_52"] is None and fh["lo_52"] is not None: y["lo_52"] = fh["lo_52"]
+
     new_flag = is_new(e["filed"])
     display_ticker = f"🆕 {sym}" if new_flag else sym
     return {
