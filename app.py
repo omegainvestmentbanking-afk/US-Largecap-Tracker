@@ -538,7 +538,12 @@ if "fetching" not in st.session_state:
 def needs_refresh():
     if st.session_state.cached_df is None: return True
     if st.session_state.last_fetch is None: return True
-    elapsed = (datetime.now() - st.session_state.last_fetch).total_seconds()
+    # Use UTC-aware datetime for comparison
+    now = datetime.now(timezone.utc)
+    last = st.session_state.last_fetch
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    elapsed = (now - last).total_seconds()
     return elapsed >= REFRESH_SECONDS
 
 # ════════════════════════════════════════════════════════════
@@ -601,7 +606,7 @@ if st.session_state.cached_df is None:
     time.sleep(0.3)
     progress.empty()
     st.session_state.cached_df = df
-    st.session_state.last_fetch = datetime.now()
+    st.session_state.last_fetch = datetime.now(timezone.utc)
     st.rerun()
 
 # ════════════════════════════════════════════════════════════
@@ -619,7 +624,7 @@ def refresh_check():
             new_df = do_full_fetch()
             if new_df is not None and len(new_df) > 0:
                 st.session_state.cached_df = new_df
-                st.session_state.last_fetch = datetime.now()
+                st.session_state.last_fetch = datetime.now(timezone.utc)
         finally:
             st.session_state.fetching = False
         st.rerun()
@@ -631,16 +636,19 @@ valid = df[df["Day Chg %"].notna()]
 new_filings = df[df["_is_new"] == True].copy()
 new_count = len(new_filings)
 
-age_secs = (datetime.now() - last_update).total_seconds()
+# Normalize last_update to UTC-aware (handle legacy naive sessions too)
+if last_update.tzinfo is None:
+    last_update_utc = last_update.replace(tzinfo=timezone.utc)
+else:
+    last_update_utc = last_update
+
+age_secs = (datetime.now(timezone.utc) - last_update_utc).total_seconds()
 is_stale = age_secs >= REFRESH_SECONDS
 stale_pill = '<span class="updating">refreshing…</span>' if is_stale else ''
 
 # Format both IST and US Eastern times
-# st.session_state.last_fetch is a naive datetime in server local time
-# We treat it as UTC since Streamlit Cloud servers run in UTC
-last_utc = last_update.replace(tzinfo=timezone.utc) if last_update.tzinfo is None else last_update
-last_ist = last_utc.astimezone(IST)
-last_est = last_utc.astimezone(US_EAST)
+last_ist = last_update_utc.astimezone(IST)
+last_est = last_update_utc.astimezone(US_EAST)
 est_label = last_est.strftime("%Z")  # "EST" or "EDT" depending on DST
 
 now_utc = datetime.now(timezone.utc)
